@@ -1,0 +1,786 @@
+name: Universal ZIP to APK
+
+"on":
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: "Optional path to a ZIP in the repository (blank = auto-detect)"
+        required: false
+        type: string
+  push:
+    branches:
+      - main
+    paths:
+      - "*.zip"
+      - "**/*.zip"
+      - ".github/workflows/universal-zip-to-apk.yml"
+      - "tools/detect_project.py"
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Inspect ZIP and detect build system
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      project_type: ${{ steps.detect.outputs.project_type }}
+      zip_file: ${{ steps.zip.outputs.zip_file }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Locate ZIP
+        id: zip
+        shell: bash
+        env:
+          INPUT_ZIP: ${{ inputs.zip_path }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_ZIP:-}" ]; then
+            ZIP_FILE="$INPUT_ZIP"
+            if [ ! -f "$ZIP_FILE" ]; then
+              echo "::error::Specified ZIP does not exist: $ZIP_FILE"
+              exit 1
+            fi
+          else
+            mapfile -t ZIPS < <(find . -type f -iname '*.zip' \
+              -not -path './.git/*' -not -path './.github/*' | sort)
+            if [ "${#ZIPS[@]}" -eq 0 ]; then
+              echo "::error::No ZIP found. Upload a project ZIP to the repository or provide zip_path."
+              exit 1
+            fi
+            if [ "${#ZIPS[@]}" -gt 1 ]; then
+              echo "::error::Multiple ZIP files found. Set zip_path to the ZIP you want to build."
+              printf ' - %s\n' "${ZIPS[@]}"
+              exit 1
+            fi
+            ZIP_FILE="${ZIPS[0]}"
+          fi
+          echo "Selected ZIP: $ZIP_FILE"
+          echo "zip_file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Safely extract ZIP for detection
+        shell: bash
+        env:
+          ZIP_FILE: ${{ steps.zip.outputs.zip_file }}
+        run: |
+          set -euo pipefail
+          mkdir -p workspace/source
+          python3 - "$ZIP_FILE" <<'PY'
+          import sys, zipfile
+          from pathlib import Path
+          archive = Path(sys.argv[1])
+          dest = Path("workspace/source").resolve()
+          with zipfile.ZipFile(archive) as z:
+              for item in z.infolist():
+                  target = (dest / item.filename).resolve()
+                  if target != dest and dest not in target.parents:
+                      raise SystemExit(f"Unsafe ZIP path detected: {item.filename}")
+              z.extractall(dest)
+          PY
+
+      - name: Detect project type
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f tools/detect_project.py ]; then
+            echo "::error::tools/detect_project.py is missing from the repository."
+            exit 1
+          fi
+          RESULT="$(python3 tools/detect_project.py workspace/source)"
+          echo "$RESULT"
+          TYPE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["project_type"])' <<< "$RESULT")"
+          echo "project_type=$TYPE" >> "$GITHUB_OUTPUT"
+
+  build-godot:
+    name: Build Godot Android APK
+    needs: detect
+    if: needs.detect.outputs.project_type == 'godot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: barichello/godot-ci:4.3
+      # Host folders we delete in the first step. They hold ~15 GB of tools
+      # this job never uses, and the host disk is what runs out of space.
+      volumes:
+        - /usr/local/lib/android:/host/android
+        - /usr/share/dotnet:/host/dotnet
+        - /opt/ghc:/host/ghc
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space on the runner host
+        shell: bash
+        run: |
+          echo "Disk before cleanup:"; df -h / || true
+          for d in /host/android /host/dotnet /host/ghc; do
+            if [ -d "$d" ]; then rm -rf "$d"/* 2>/dev/null || true; fi
+          done
+          echo "Disk after cleanup:"; df -h / || true
+
+      - name: Ensure required tools and Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v python3 >/dev/null 2>&1 || ! command -v wget >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y python3 wget unzip
+          fi
+          if ! command -v java >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y openjdk-17-jdk
+          fi
+
+          GODOT_VERSION="$(godot --version)"
+          echo "Godot version: $GODOT_VERSION"
+          case "$GODOT_VERSION" in
+            4.3* ) TEMPLATE_VERSION="4.3.stable" ;;
+            * ) echo "::error::This job requires Godot 4.3.x; detected $GODOT_VERSION"; exit 1 ;;
+          esac
+
+          SDK_PATH="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/lib/android-sdk}}"
+          if [ ! -d "$SDK_PATH" ]; then
+            for candidate in /opt/android-sdk /usr/local/android-sdk "$HOME/Android/Sdk"; do
+              if [ -d "$candidate" ]; then SDK_PATH="$candidate"; break; fi
+            done
+          fi
+          if [ ! -d "$SDK_PATH" ]; then
+            echo "::error::Android SDK directory not found in the Godot CI image."
+            exit 1
+          fi
+
+          JAVA_PATH="${JAVA_HOME:-/usr/lib/jvm/java-17-openjdk-amd64}"
+          echo "ANDROID_SDK_ROOT=$SDK_PATH" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK_PATH" >> "$GITHUB_ENV"
+          echo "JAVA_HOME=$JAVA_PATH" >> "$GITHUB_ENV"
+          echo "PATH=$JAVA_PATH/bin:$SDK_PATH/platform-tools:$PATH" >> "$GITHUB_ENV"
+
+          # Godot searches this exact directory for templates. Install each file
+          # individually: the template package may not place every android_* file
+          # beside android_source.zip, so a directory-wide wildcard is unreliable.
+          TEMPLATE_URL="https://github.com/godotengine/godot/releases/download/4.3-stable/Godot_v4.3-stable_export_templates.tpz"
+          TMP_TEMPLATES="/tmp/godot-templates"
+          mkdir -p "$TMP_TEMPLATES"
+          wget -q "$TEMPLATE_URL" -O /tmp/godot-templates.tpz
+          unzip -oq /tmp/godot-templates.tpz 'templates/android_*' -d "$TMP_TEMPLATES" \
+            || unzip -oq /tmp/godot-templates.tpz -d "$TMP_TEMPLATES"
+          rm -f /tmp/godot-templates.tpz
+
+          # Godot in this image reports /github/home as its template root.
+          TEMPLATE_DIRS=("$HOME/.local/share/godot/export_templates/$TEMPLATE_VERSION")
+          if [ -d /github/home ] && [ "$HOME" != "/github/home" ]; then
+            TEMPLATE_DIRS+=("/github/home/.local/share/godot/export_templates/$TEMPLATE_VERSION")
+          fi
+
+          for TEMPLATE_DIR in "${TEMPLATE_DIRS[@]}"; do
+            mkdir -p "$TEMPLATE_DIR"
+            for TEMPLATE_FILE in android_source.zip android_debug.apk android_release.apk; do
+              FOUND="$(find "$TMP_TEMPLATES" -type f -name "$TEMPLATE_FILE" -print -quit)"
+              if [ -z "$FOUND" ]; then
+                echo "::error::Godot 4.3 export-template package is missing $TEMPLATE_FILE."
+                find "$TMP_TEMPLATES" -maxdepth 4 -type f -printf '%P\n' | head -80
+                exit 1
+              fi
+              install -m 0644 "$FOUND" "$TEMPLATE_DIR/$TEMPLATE_FILE"
+              test -s "$TEMPLATE_DIR/$TEMPLATE_FILE"
+            done
+            echo "Installed Godot templates in $TEMPLATE_DIR"
+            ls -lh "$TEMPLATE_DIR/android_source.zip" "$TEMPLATE_DIR/android_debug.apk" "$TEMPLATE_DIR/android_release.apk"
+          done
+
+          rm -rf "$TMP_TEMPLATES"
+
+          # The light (non-Gradle) export signs the APK itself, so it needs a
+          # debug keystore. The Gradle path made its own, so this was never set up.
+          DEBUG_KEYSTORE="/tmp/godot-debug.keystore"
+          KEYTOOL="$JAVA_PATH/bin/keytool"
+          if [ ! -x "$KEYTOOL" ]; then KEYTOOL="keytool"; fi
+          if [ ! -f "$DEBUG_KEYSTORE" ]; then
+            "$KEYTOOL" -genkeypair -keystore "$DEBUG_KEYSTORE" \
+              -storepass android -keypass android -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+          mkdir -p "$HOME/.config/godot"
+          cat > "$HOME/.config/godot/editor_settings-4.tres" <<EOF
+          [gd_resource type="EditorSettings" format=3]
+          [resource]
+          export/android/android_sdk_path = "$SDK_PATH"
+          export/android/java_sdk_path = "$JAVA_PATH"
+          export/android/debug_keystore = "$DEBUG_KEYSTORE"
+          export/android/debug_keystore_user = "androiddebugkey"
+          export/android/debug_keystore_pass = "android"
+          EOF
+          if [ -d /github/home ] && [ "$HOME" != "/github/home" ]; then
+            mkdir -p /github/home/.config/godot
+            cp "$HOME/.config/godot/editor_settings-4.tres" /github/home/.config/godot/editor_settings-4.tres
+          fi
+
+          echo "Checking Android SDK manager and build tools..."
+          SDKMANAGER=""
+          for CANDIDATE in \
+            "$SDK_PATH/cmdline-tools/latest/bin/sdkmanager" \
+            "$SDK_PATH/tools/bin/sdkmanager"; do
+            if [ -x "$CANDIDATE" ]; then SDKMANAGER="$CANDIDATE"; break; fi
+          done
+          if [ -z "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$SDK_PATH" -type f -name sdkmanager -perm -u+x -print -quit 2>/dev/null || true)"
+          fi
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager was not found under $SDK_PATH; cannot ensure Android SDK 34/build-tools 34.0.0."
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          # Base packages for the light export. The NDK and CMake (about 2 GB)
+          # are only installed later if the Gradle fallback is needed.
+          "$SDKMANAGER" --sdk_root="$SDK_PATH" \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "cmdline-tools;latest"
+          echo "SDKMANAGER_BIN=$SDKMANAGER" >> "$GITHUB_ENV"
+          echo "Godot templates and Android SDK components are ready."
+
+      - name: Extract selected ZIP
+        shell: bash
+        env:
+          ZIP_FILE: ${{ needs.detect.outputs.zip_file }}
+        run: |
+          set -euo pipefail
+          mkdir -p workspace/source
+          unzip -q "$ZIP_FILE" -d workspace/source
+
+      - name: Find Godot project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE="$(find workspace/source -type f -name project.godot -print -quit)"
+          if [ -z "$FILE" ]; then
+            echo "::error::project.godot was not found in the selected ZIP."
+            exit 1
+          fi
+          echo "dir=$(dirname "$FILE")" >> "$GITHUB_OUTPUT"
+          echo "Godot project: $(dirname "$FILE")"
+
+      - name: Configure Android export preset for CI
+        shell: bash
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          set -euo pipefail
+          PRESETS="export_presets.cfg"
+
+          # Godot export presets are INI-like sections. Do not use a brittle regex
+          # that can miss valid [preset.0] headers.
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("export_presets.cfg")
+          text = path.read_text(encoding="utf-8") if path.exists() else ""
+          lines = text.splitlines()
+
+          def section_ranges(lines):
+              starts = []
+              for i, line in enumerate(lines):
+                  stripped = line.strip()
+                  if stripped.startswith("[") and stripped.endswith("]"):
+                      starts.append((i, stripped[1:-1]))
+              ranges = []
+              for n, (start, name) in enumerate(starts):
+                  end = starts[n + 1][0] if n + 1 < len(starts) else len(lines)
+                  ranges.append((start, end, name))
+              return ranges
+
+          ranges = section_ranges(lines)
+          android_index = None
+          for start, end, section in ranges:
+              if not re.fullmatch(r"preset\.\d+", section):
+                  continue
+              block = "\n".join(lines[start:end])
+              name_match = re.search(r'(?m)^name\s*=\s*"Android"\s*$', block)
+              platform_match = re.search(r'(?m)^platform\s*=\s*"Android"\s*$', block)
+              if name_match and platform_match:
+                  android_index = int(section.split(".")[1])
+                  break
+
+          if android_index is None:
+              existing = [
+                  int(section.split(".")[1])
+                  for _, _, section in ranges
+                  if re.fullmatch(r"preset\.\d+", section)
+              ]
+              android_index = max(existing, default=-1) + 1
+              if lines and lines[-1].strip():
+                  lines.append("")
+              lines.extend([
+                  f"[preset.{android_index}]",
+                  'name="Android"',
+                  'platform="Android"',
+                  "runnable=true",
+                  "dedicated_server=false",
+                  'custom_features=""',
+                  'export_filter="all_resources"',
+                  'include_filter=""',
+                  'exclude_filter=""',
+                  'export_path="build/Game-debug.apk"',
+                  'encryption_include_filters=""',
+                  'encryption_exclude_filters=""',
+                  "encrypt_pck=false",
+                  "encrypt_directory=false",
+                  "",
+                  f"[preset.{android_index}.options]",
+                  'custom_template/debug=""',
+                  'custom_template/release=""',
+                  "gradle_build/use_gradle_build=true",
+                  'gradle_build/gradle_build_directory=""',
+                  "gradle_build/export_format=0",
+                  'gradle_build/min_sdk="23"',
+                  'gradle_build/target_sdk="34"',
+                  "architectures/armeabi-v7a=false",
+                  "architectures/arm64-v8a=true",
+                  "architectures/x86=false",
+                  "architectures/x86_64=false",
+              ])
+          else:
+              # Update only the Android options section, preserving all other presets.
+              options_name = f"preset.{android_index}.options"
+              ranges = section_ranges(lines)
+              option_range = next(
+                  ((start, end) for start, end, section in ranges if section == options_name),
+                  None
+              )
+              if option_range is None:
+                  if lines and lines[-1].strip():
+                      lines.append("")
+                  lines.extend([
+                      f"[{options_name}]",
+                      "gradle_build/use_gradle_build=true",
+                      'gradle_build/min_sdk="23"',
+                      'gradle_build/target_sdk="34"',
+                  ])
+              else:
+                  start, end = option_range
+                  block_lines = lines[start:end]
+                  def set_key(key, value):
+                      pat = re.compile(r"^" + re.escape(key) + r"\s*=.*$")
+                      for j in range(1, len(block_lines)):
+                          if pat.match(block_lines[j].strip()):
+                              block_lines[j] = value
+                              return
+                      block_lines.append(value)
+                  set_key("gradle_build/use_gradle_build", "gradle_build/use_gradle_build=true")
+                  set_key("gradle_build/min_sdk", 'gradle_build/min_sdk="23"')
+                  set_key("gradle_build/target_sdk", 'gradle_build/target_sdk="34"')
+                  lines[start:end] = block_lines
+
+          path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+          # Read back and verify the effective Android preset and its options.
+          check = path.read_text(encoding="utf-8").splitlines()
+          ranges = section_ranges(check)
+          selected = None
+          for start, end, section in ranges:
+              if not re.fullmatch(r"preset\.\d+", section):
+                  continue
+              block = "\n".join(check[start:end])
+              if re.search(r'(?m)^name\s*=\s*"Android"\s*$', block) and re.search(r'(?m)^platform\s*=\s*"Android"\s*$', block):
+                  selected = int(section.split(".")[1])
+                  break
+          if selected is None:
+              raise SystemExit("Verification failed: Android export preset could not be created or found.")
+          options = dict()
+          for start, end, section in ranges:
+              if section == f"preset.{selected}.options":
+                  for line in check[start + 1:end]:
+                      if "=" in line and not line.lstrip().startswith(";"):
+                          key, value = line.split("=", 1)
+                          options[key.strip()] = value.strip()
+          expected = {
+              "gradle_build/use_gradle_build": "true",
+              "gradle_build/min_sdk": '"23"',
+              "gradle_build/target_sdk": '"34"',
+          }
+          for key, value in expected.items():
+              if options.get(key) != value:
+                  raise SystemExit(f"Verification failed: {key} expected {value}, got {options.get(key)!r}")
+          print(f"Verified Android export preset: preset.{selected}")
+          for key, value in expected.items():
+              print(f"  {key}={value}")
+          PY
+
+      - name: Enable ETC2/ASTC texture import for Android
+        shell: bash
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCONFIG'
+          from pathlib import Path
+          import re
+
+          path = Path("project.godot")
+          if not path.is_file():
+              raise SystemExit("project.godot is missing; cannot configure Android texture import.")
+
+          lines = path.read_text(encoding="utf-8").splitlines()
+          section_starts = []
+          for index, line in enumerate(lines):
+              stripped = line.strip()
+              if stripped.startswith("[") and stripped.endswith("]"):
+                  section_starts.append((index, stripped[1:-1]))
+
+          rendering = next((i for i, (_, name) in enumerate(section_starts) if name == "rendering"), None)
+          setting = "textures/vram_compression/import_etc2_astc"
+          setting_line = setting + "=true"
+
+          if rendering is None:
+              if lines and lines[-1].strip():
+                  lines.append("")
+              lines.extend(["[rendering]", setting_line])
+          else:
+              start = section_starts[rendering][0]
+              end = section_starts[rendering + 1][0] if rendering + 1 < len(section_starts) else len(lines)
+              found = False
+              key_pattern = re.compile(r"^\s*" + re.escape(setting) + r"\s*=")
+              for i in range(start + 1, end):
+                  if key_pattern.match(lines[i]):
+                      lines[i] = setting_line
+                      found = True
+                      break
+              if not found:
+                  lines.insert(end, setting_line)
+
+          path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+          verify = path.read_text(encoding="utf-8")
+          if not re.search(r"(?m)^\s*textures/vram_compression/import_etc2_astc\s*=\s*true\s*$", verify):
+              raise SystemExit("Verification failed: ETC2/ASTC Android texture import setting is not enabled.")
+          print("Verified project.godot: textures/vram_compression/import_etc2_astc=true")
+          PYCONFIG
+
+      - name: Use the fixed signing key (keeps updates installable)
+        shell: bash
+        working-directory: ${{ steps.project.outputs.dir }}
+        env:
+          KS_B64: ${{ secrets.TEST_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.TEST_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.TEST_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          KS=""; USERNAME=""; PASS=""
+          if [ -n "${KS_B64:-}" ] && [ -n "${KS_PASS:-}" ] && [ -n "${KS_ALIAS:-}" ]; then
+            printf '%s' "$KS_B64" | base64 -d > /tmp/test-signing.keystore
+            KS="/tmp/test-signing.keystore"; USERNAME="$KS_ALIAS"; PASS="$KS_PASS"
+            echo "Signing key: repository secrets (shared test key)."
+          elif [ -f "$PWD/signing/lvf.keystore" ]; then
+            KS="$PWD/signing/lvf.keystore"; USERNAME="lvf"; PASS="lvfarm2026"
+            echo "Signing key: signing/lvf.keystore from the ZIP."
+          else
+            echo "::warning::No signing key (no repository secrets, none in the ZIP). This build uses a temporary key and cannot update an installed app."
+            exit 0
+          fi
+          export KS USERNAME PASS
+          python3 - <<'PYKEY'
+          import os, re
+          from pathlib import Path
+          ks, user, pw = os.environ["KS"], os.environ["USERNAME"], os.environ["PASS"]
+          path = Path("export_presets.cfg")
+          lines = path.read_text(encoding="utf-8").splitlines()
+          idx = None
+          cur = None
+          for i, l in enumerate(lines):
+              m = re.fullmatch(r"\[preset\.(\d+)\]", l.strip())
+              if m:
+                  cur = m.group(1)
+              if cur is not None and l.strip() == 'platform="Android"':
+                  idx = cur
+                  break
+          if idx is None:
+              raise SystemExit("Android preset not found")
+          header = f"[preset.{idx}.options]"
+          start = next(i for i, l in enumerate(lines) if l.strip() == header)
+          end = next((i for i in range(start + 1, len(lines)) if lines[i].strip().startswith("[")), len(lines))
+          block = lines[start:end]
+          vals = {
+              "keystore/debug": f'"{ks}"',
+              "keystore/debug_user": f'"{user}"',
+              "keystore/debug_password": f'"{pw}"',
+          }
+          for key, val in vals.items():
+              new = f"{key}={val}"
+              for j in range(1, len(block)):
+                  if re.match(r"^" + re.escape(key) + r"\s*=", block[j].strip()):
+                      block[j] = new
+                      break
+              else:
+                  block.append(new)
+          lines[start:end] = block
+          path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+          print("Export preset now uses the fixed key.")
+          PYKEY
+          # Editor settings too, so the Gradle fallback signs with the same key.
+          for F in "$HOME/.config/godot/editor_settings-4.tres" /github/home/.config/godot/editor_settings-4.tres; do
+            if [ -f "$F" ]; then
+              sed -i "s|^export/android/debug_keystore = .*|export/android/debug_keystore = \"$KS\"|; s|^export/android/debug_keystore_user = .*|export/android/debug_keystore_user = \"$USERNAME\"|; s|^export/android/debug_keystore_pass = .*|export/android/debug_keystore_pass = \"$PASS\"|" "$F"
+            fi
+          done
+          grep -n "^keystore/" export_presets.cfg | sed 's/password=.*/password=***/'
+
+      - name: Import project and export debug APK with diagnostics
+        shell: bash
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          set -euo pipefail
+          echo "=== Godot version ==="
+          godot --version
+          echo "=== Android SDK / Java environment ==="
+          printf 'ANDROID_SDK_ROOT=%s\nANDROID_HOME=%s\nJAVA_HOME=%s\n' "${ANDROID_SDK_ROOT:-}" "${ANDROID_HOME:-}" "${JAVA_HOME:-}"
+          java -version 2>&1 || true
+          echo "=== Required SDK packages ==="
+          for item in \
+            "$ANDROID_SDK_ROOT/platform-tools/adb" \
+            "$ANDROID_SDK_ROOT/platforms/android-34/android.jar" \
+            "$ANDROID_SDK_ROOT/build-tools/34.0.0/aapt" \
+            "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"; do
+            if [ -e "$item" ]; then echo "FOUND: $item"; else echo "MISSING: $item"; fi
+          done
+          echo "=== Project Android template before export ==="
+          if [ -d android/build ]; then
+            find android/build -maxdepth 2 -type f -print | sort | head -80
+          else
+            echo "android/build directory does not exist yet; Godot must install/generate it."
+          fi
+          echo "=== Import project ==="
+          set +e
+          godot --headless --editor --verbose --path . --quit 2>&1 | tee /tmp/godot-import.log
+          IMPORT_STATUS=${PIPESTATUS[0]}
+          set -e
+          if [ "$IMPORT_STATUS" -ne 0 ]; then
+            echo "::error::Godot project import failed (exit code: $IMPORT_STATUS). Import log follows."
+            tail -n 250 /tmp/godot-import.log || true
+            exit "$IMPORT_STATUS"
+          fi
+          mkdir -p build
+          echo "=== Disk space before export ==="; df -h / || true
+          echo "=== Attempt 1: light export without Gradle (verbose log follows) ==="
+          sed -i 's#^gradle_build/use_gradle_build=true#gradle_build/use_gradle_build=false#' export_presets.cfg
+          grep -n 'use_gradle_build' export_presets.cfg || true
+          set +e
+          godot --headless --verbose --path . \
+            --export-debug "Android" build/Game-debug.apk \
+            2>&1 | tee /tmp/godot-export-console.log
+          EXPORT_STATUS=${PIPESTATUS[0]}
+          set -e
+          if [ "$EXPORT_STATUS" -ne 0 ] || [ ! -s build/Game-debug.apk ]; then
+            echo "::warning::Light export failed (exit code: $EXPORT_STATUS). Falling back to the Gradle build."
+            rm -f build/Game-debug.apk
+            df -h / || true
+            "$SDKMANAGER_BIN" --sdk_root="$ANDROID_SDK_ROOT" \
+              "cmake;3.10.2.4988404" "ndk;23.2.8568313" \
+              || echo "::warning::NDK/CMake install failed; continuing."
+            sed -i 's#^gradle_build/use_gradle_build=false#gradle_build/use_gradle_build=true#' export_presets.cfg
+            echo "=== Attempt 2: Gradle build (verbose log follows) ==="
+            set +e
+            godot --headless --verbose --path . \
+              --install-android-build-template \
+              --export-debug "Android" build/Game-debug.apk \
+              2>&1 | tee -a /tmp/godot-export-console.log
+            EXPORT_STATUS=${PIPESTATUS[0]}
+            set -e
+          fi
+          echo "=== Disk space after export ==="; df -h / || true
+          echo "=== End of Godot export output (exit code: $EXPORT_STATUS) ==="
+          if [ "$EXPORT_STATUS" -ne 0 ]; then
+            echo "::error::Godot Android export failed. Diagnostic details follow."
+            echo "=== Android preset ==="
+            if [ -f export_presets.cfg ]; then cat export_presets.cfg; else echo "export_presets.cfg is missing"; fi
+            echo "=== Editor settings ==="
+            for settings in \
+              "$HOME/.config/godot/editor_settings-4.tres" \
+              /github/home/.config/godot/editor_settings-4.tres; do
+              if [ -f "$settings" ]; then echo "--- $settings"; cat "$settings"; fi
+            done
+            echo "=== Android template directories ==="
+            for dir in \
+              "$HOME/.local/share/godot/export_templates/4.3.stable" \
+              /github/home/.local/share/godot/export_templates/4.3.stable; do
+              if [ -d "$dir" ]; then ls -lah "$dir"; fi
+            done
+            echo "=== Generated Android project files ==="
+            if [ -d android ]; then find android -maxdepth 4 -type f -print | sort | head -200; else echo "No android directory in project"; fi
+            exit "$EXPORT_STATUS"
+          fi
+          if [ ! -s build/Game-debug.apk ]; then
+            echo "::error::Godot returned success but build/Game-debug.apk is missing or empty."
+            exit 1
+          fi
+          echo "APK successfully created: $(du -h build/Game-debug.apk | cut -f1)"
+
+      - name: Show signing certificate (must be identical on every build)
+        shell: bash
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          keytool -printcert -jarfile build/Game-debug.apk | grep -E "Owner|SHA256" || true
+
+      - name: Upload Godot APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Android-APK-Godot
+          path: ${{ steps.project.outputs.dir }}/build/Game-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  build-flutter:
+    name: Build Flutter Android APK
+    needs: detect
+    if: needs.detect.outputs.project_type == 'flutter'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract ZIP and locate Flutter project
+        shell: bash
+        env:
+          ZIP_FILE: ${{ needs.detect.outputs.zip_file }}
+        run: |
+          set -euo pipefail
+          python3 - "$ZIP_FILE" <<'PY'
+          import sys, zipfile
+          from pathlib import Path
+          dest = Path("workspace/source").resolve()
+          dest.mkdir(parents=True, exist_ok=True)
+          with zipfile.ZipFile(sys.argv[1]) as z:
+              for item in z.infolist():
+                  target = (dest / item.filename).resolve()
+                  if target != dest and dest not in target.parents:
+                      raise SystemExit(f"Unsafe ZIP path detected: {item.filename}")
+              z.extractall(dest)
+          PY
+          PUBSPEC="$(find workspace/source -type f -name pubspec.yaml -print -quit)"
+          if [ -z "$PUBSPEC" ]; then
+            echo "::error::pubspec.yaml was not found in the selected ZIP."
+            exit 1
+          fi
+          echo "FLUTTER_DIR=$(dirname "$PUBSPEC")" >> "$GITHUB_ENV"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Build Flutter debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$FLUTTER_DIR"
+          flutter pub get
+          flutter build apk --debug
+          test -s build/app/outputs/flutter-apk/app-debug.apk
+
+      - name: Upload Flutter APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Android-APK-Flutter
+          path: ${{ env.FLUTTER_DIR }}/build/app/outputs/flutter-apk/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  build-gradle:
+    name: Build Android Gradle APK
+    needs: detect
+    if: needs.detect.outputs.project_type == 'android-gradle' || needs.detect.outputs.project_type == 'react-native-android'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract ZIP and locate Gradle project
+        shell: bash
+        env:
+          ZIP_FILE: ${{ needs.detect.outputs.zip_file }}
+        run: |
+          set -euo pipefail
+          python3 - "$ZIP_FILE" <<'PY'
+          import sys, zipfile
+          from pathlib import Path
+          dest = Path("workspace/source").resolve()
+          dest.mkdir(parents=True, exist_ok=True)
+          with zipfile.ZipFile(sys.argv[1]) as z:
+              for item in z.infolist():
+                  target = (dest / item.filename).resolve()
+                  if target != dest and dest not in target.parents:
+                      raise SystemExit(f"Unsafe ZIP path detected: {item.filename}")
+              z.extractall(dest)
+          PY
+          SETTINGS="$(find workspace/source -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)"
+          if [ -n "$SETTINGS" ]; then
+            PROJECT_DIR="$(dirname "$SETTINGS")"
+          else
+            GRADLEW="$(find workspace/source -type f -name gradlew -print -quit)"
+            if [ -z "$GRADLEW" ]; then
+              echo "::error::Neither settings.gradle(.kts) nor gradlew was found."
+              exit 1
+            fi
+            PROJECT_DIR="$(dirname "$GRADLEW")"
+          fi
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          if [ ! -f ./gradlew ]; then
+            echo "::error::Gradle wrapper (gradlew) is required for reproducible builds."
+            exit 1
+          fi
+          chmod +x ./gradlew
+          ./gradlew --no-daemon assembleDebug
+
+      - name: Locate APK
+        id: apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$(find "$PROJECT_DIR" -type f -path '*/build/outputs/apk/*/*.apk' -print -quit)"
+          if [ -z "$APK" ]; then
+            echo "::error::Build completed but no APK was found."
+            exit 1
+          fi
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Android-APK-Gradle
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
+
+  unsupported:
+    name: Explain unsupported project type
+    needs: detect
+    if: needs.detect.outputs.project_type == 'web-or-node' || needs.detect.outputs.project_type == 'unknown'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain required build adapter
+        env:
+          TYPE: ${{ needs.detect.outputs.project_type }}
+        run: |
+          echo "::error::Detected project type '$TYPE', but no safe APK build adapter is configured for it."
+          echo "Web projects need an Android wrapper strategy; other engines need their own export adapter."
+          exit 1
